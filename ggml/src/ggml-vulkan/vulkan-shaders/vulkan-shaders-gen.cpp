@@ -11,6 +11,7 @@
 #include <future>
 #include <queue>
 #include <condition_variable>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -35,6 +36,7 @@
 std::mutex lock;
 std::vector<std::pair<std::string, std::string>> shader_fnames;
 std::locale c_locale("C");
+std::atomic<bool> shader_compile_failed{false};
 
 std::string GLSLC = "glslc";
 std::string input_filepath = "";
@@ -313,8 +315,13 @@ using compile_count_guard = std::unique_ptr<uint32_t, decltype(&decrement_compil
 
 compile_count_guard acquire_compile_slot() {
     // wait until fewer than N compiles are in progress.
-    // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
-    uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    // Keep glslc pressure bounded on CI to avoid flaky shader generation.
+    uint32_t N = 4;
+    if (const char * env_n = std::getenv("GGML_VULKAN_GLSLC_JOBS")) {
+        N = std::max(1u, static_cast<uint32_t>(std::strtoul(env_n, nullptr, 10)));
+    } else {
+        N = std::max(1u, std::min(N, std::thread::hardware_concurrency()));
+    }
     std::unique_lock<std::mutex> guard(compile_count_mutex);
     compile_count_cond.wait(guard, [N] { return compile_count < N; });
     compile_count++;
@@ -370,11 +377,25 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
 
         execute_command(cmd, stdout_str, stderr_str);
         if (!stderr_str.empty()) {
-            std::cerr << "cannot compile " << name << "\n\n";
+            std::cerr << "glslc diagnostics for " << name << ":\n" << stderr_str << std::endl;
+        }
+
+        std::error_code ec;
+        const bool out_exists = std::filesystem::exists(out_path, ec);
+        const bool out_ok = out_exists && std::filesystem::file_size(out_path, ec) > 0;
+        if (!out_ok) {
+            shader_compile_failed = true;
+            std::cerr << "cannot compile " << name << " (output missing):\n";
             for (const auto& part : cmd) {
                 std::cerr << part << " ";
             }
-            std::cerr << "\n\n" << stderr_str << std::endl;
+            std::cerr << "\n";
+            if (!stdout_str.empty()) {
+                std::cerr << "stdout:\n" << stdout_str << "\n";
+            }
+            if (!stderr_str.empty()) {
+                std::cerr << "stderr:\n" << stderr_str << "\n";
+            }
             return;
         }
 
@@ -393,6 +414,7 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
         std::lock_guard<std::mutex> guard(lock);
         shader_fnames.push_back(std::make_pair(name, out_path));
     } catch (const std::exception& e) {
+        shader_compile_failed = true;
         std::cerr << "Error executing command for " << name << ": " << e.what() << std::endl;
     }
 }
@@ -1042,6 +1064,7 @@ void write_output_files() {
         if (input_filepath != "") {
             std::string data = read_binary_file(path);
             if (data.empty()) {
+                shader_compile_failed = true;
                 continue;
             }
 
@@ -1198,5 +1221,9 @@ int main(int argc, char** argv) {
 
     write_output_files();
 
+    if (shader_compile_failed) {
+        std::cerr << "One or more Vulkan shaders failed to compile or embed.\n";
+        return EXIT_FAILURE;
+    }
     return EXIT_SUCCESS;
 }
